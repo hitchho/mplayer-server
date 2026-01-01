@@ -605,6 +605,11 @@ struct Player {
     sender: UnboundedSender<PlayAction>,
     // playlist: Playlist,
     response_reciver: UnboundedReceiver<Response>,
+    // soulseek client
+    soulseek: Option<std::sync::Arc<crate::soulseek::SoulseekClient>>,
+    soulseek_results: Vec<crate::soulseek::SearchResult>,
+    soulseek_ranked: Vec<crate::soulseek::RankedFile>,
+    soulseek_search_token: Option<u32>,
 }
 
 // methods
@@ -1312,6 +1317,150 @@ impl<'a> Player {
         .unwrap_or_default()
         .to_owned()
     }
+
+    // ==================== SOULSEEK METHODS ====================
+
+    /// connect to soulseek network
+    async fn slsk_connect(
+        &mut self,
+        username: String,
+        password: String,
+        download_dir: String,
+    ) -> String {
+        use crate::soulseek::{SoulseekClient, SoulseekConfig};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let config = SoulseekConfig {
+            username,
+            password,
+            server_host: "server.slsknet.org".to_string(),
+            server_port: 2242,
+            listen_port: 2234,
+            max_results: 50,
+        };
+
+        let download_path = PathBuf::from(download_dir);
+        let client = Arc::new(SoulseekClient::new(config, download_path));
+
+        match client.connect().await {
+            Ok(_) => match client.login().await {
+                Ok(response) => {
+                    if response.success {
+                        let client_clone = Arc::clone(&client);
+                        client_clone.spawn_receiver();
+                        self.soulseek = Some(client);
+                        if response.is_new_account() {
+                            "registered and connected".to_string()
+                        } else {
+                            "connected".to_string()
+                        }
+                    } else {
+                        response
+                            .error_description()
+                            .unwrap_or_else(|| "login failed".to_string())
+                    }
+                }
+                Err(e) => format!("login error: {}", e),
+            },
+            Err(e) => format!("connect error: {}", e),
+        }
+    }
+
+    /// disconnect from soulseek
+    async fn slsk_disconnect(&mut self) -> String {
+        if let Some(client) = self.soulseek.take() {
+            client.disconnect().await;
+            "disconnected".to_string()
+        } else {
+            "not connected".to_string()
+        }
+    }
+
+    /// get soulseek connection state
+    async fn slsk_state(&self) -> crate::soulseek::ConnectionState {
+        if let Some(client) = &self.soulseek {
+            client.state().await
+        } else {
+            crate::soulseek::ConnectionState::Disconnected
+        }
+    }
+
+    /// search soulseek network (non-blocking, poll slsk_get_results for results)
+    async fn slsk_search(&mut self, query: String) -> String {
+        if let Some(client) = &self.soulseek {
+            match client.search(&query).await {
+                Ok(token) => {
+                    self.soulseek_search_token = Some(token);
+                    self.soulseek_results.clear();
+                    self.soulseek_ranked.clear();
+                    format!("searching: {}", query)
+                }
+                Err(e) => format!("search error: {}", e),
+            }
+        } else {
+            "not connected".to_string()
+        }
+    }
+
+    /// get ranked search results (fetches fresh results from active search)
+    async fn slsk_get_results(&mut self) -> Vec<crate::soulseek::RankedFile> {
+        use crate::soulseek::rank_search_results;
+
+        if let (Some(client), Some(token)) = (&self.soulseek, self.soulseek_search_token) {
+            let results = client.get_search_results(token).await;
+            if !results.is_empty() {
+                self.soulseek_results = results;
+                self.soulseek_ranked = rank_search_results(&self.soulseek_results);
+            }
+        }
+        self.soulseek_ranked.clone()
+    }
+
+    /// queue a download by index
+    async fn slsk_download(&mut self, index: u32) -> String {
+        if let Some(client) = &self.soulseek {
+            if let Some(file) = self.soulseek_ranked.get(index as usize) {
+                match client.queue_download(file).await {
+                    Ok(id) => format!("queued: {} (id: {})", file.file.basename(), id),
+                    Err(e) => format!("download error: {}", e),
+                }
+            } else {
+                "invalid index".to_string()
+            }
+        } else {
+            "not connected".to_string()
+        }
+    }
+
+    /// get download list
+    async fn slsk_get_downloads(&self) -> Vec<crate::soulseek::Download> {
+        if let Some(client) = &self.soulseek {
+            client.get_downloads().await
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// cancel a download
+    async fn slsk_cancel_download(&self, id: u32) -> String {
+        if let Some(client) = &self.soulseek {
+            client.cancel_download(id).await;
+            "cancelled".to_string()
+        } else {
+            "not connected".to_string()
+        }
+    }
+
+    /// clear finished downloads
+    async fn slsk_clear_finished(&self) -> String {
+        if let Some(client) = &self.soulseek {
+            client.clear_finished_downloads().await;
+            "cleared".to_string()
+        } else {
+            "not connected".to_string()
+        }
+    }
 }
 
 pub struct Server {
@@ -1371,7 +1520,10 @@ impl Server {
             player: Player {
                 response_reciver,
                 sender,
-                // playlist,
+                soulseek: None,
+                soulseek_results: Vec::new(),
+                soulseek_ranked: Vec::new(),
+                soulseek_search_token: None,
             },
         }
     }
@@ -1397,7 +1549,10 @@ impl Server {
             player: Player {
                 response_reciver,
                 sender,
-                // playlist,
+                soulseek: None,
+                soulseek_results: Vec::new(),
+                soulseek_ranked: Vec::new(),
+                soulseek_search_token: None,
             },
         }
     }
@@ -1543,9 +1698,10 @@ impl Playlist {
         let mut playlist = Self::visit_dirs(&PathBuf::from_str(&cfg.path).unwrap(), cfg);
         playlist.sort(cfg.sort);
         playlist.name = String::from("default");
-        playlist
-            .save(&PathBuf::from_str(&cfg.playlist_save_path).unwrap())
-            .unwrap();
+        // save playlist, but don't crash if it fails
+        if let Err(e) = playlist.save(&PathBuf::from_str(&cfg.playlist_save_path).unwrap()) {
+            tracing::warn!("failed to save playlist: {}", e);
+        }
         playlist
     }
 
@@ -1611,11 +1767,15 @@ impl Playlist {
     }
 
     fn save(&mut self, path: &PathBuf) -> std::io::Result<()> {
-        let content = std::fs::read_to_string(path).unwrap();
+        let content = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".to_string());
         let mut map = serde_json::from_str::<HashMap<&str, Playlist>>(&content).unwrap_or_default();
         map.insert(&self.name, self.to_owned());
 
-        std::fs::write(path, serde_json::to_string_pretty(&map).unwrap()).unwrap();
+        // create parent directories if needed
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&map).unwrap())?;
         Ok(())
     }
 

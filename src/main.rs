@@ -3,6 +3,7 @@ use tracing::instrument;
 
 mod light_client;
 mod server;
+mod soulseek;
 mod utils;
 
 #[tokio::main]
