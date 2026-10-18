@@ -1,24 +1,22 @@
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::timeout;
 
 use super::download::DownloadManager;
 use super::listener::PeerListener;
-use super::messages::{
-    parse_file_search_response, parse_server_message, LoginResponse, ServerMessage,
-};
-use super::peer::{self, PeerEvent};
+use super::messages::{parse_server_message, LoginResponse, ServerMessage};
+use super::peer::{PeerEvent, PeerShared};
 use super::protocol::{
     pack_file_search, pack_login, pack_set_status, pack_set_wait_port, pack_shared_folders_files,
-    MessageWriter, ServerCode, MAX_MESSAGE_SIZE,
+    MAX_MESSAGE_SIZE,
 };
 use super::types::{
     ConnectionState, Download, DownloadState, RankedFile, SearchResult, SoulseekConfig,
@@ -30,30 +28,22 @@ const MINOR_VERSION: u32 = 3;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn pack_get_peer_address(username: &str) -> Vec<u8> {
-    let mut w = MessageWriter::new();
-    w.write_string(username);
-    w.into_message(ServerCode::GetPeerAddress as u32)
-}
-
-/// pending peer address request
-#[allow(dead_code)]
-struct PendingDownload {
-    download: Download,
-    username: String,
-}
-
 #[allow(dead_code)]
 pub struct SoulseekClient {
     config: SoulseekConfig,
     state: Arc<RwLock<ConnectionState>>,
-    stream: Arc<Mutex<Option<TcpStream>>>,
+    /// server socket halves, locked separately so the receive loop's
+    /// blocking read never holds up outgoing messages
+    reader: Arc<Mutex<Option<OwnedReadHalf>>>,
+    writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
+    /// peer listener task, aborted on disconnect to free the listen port
+    listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
     search_token: AtomicU32,
     transfer_token: AtomicU32,
     pending_searches: Arc<RwLock<HashMap<u32, mpsc::Sender<SearchResult>>>>,
     search_results: Arc<RwLock<HashMap<u32, Vec<SearchResult>>>>,
-    /// downloads waiting for peer address
-    pending_downloads: Arc<RwLock<HashMap<String, Vec<PendingDownload>>>>,
+    /// peer connections and the download state machine
+    peer: Arc<PeerShared>,
     /// download manager
     download_manager: Arc<DownloadManager>,
     /// channel for peer events
@@ -67,16 +57,27 @@ impl SoulseekClient {
         let (peer_event_tx, peer_event_rx) = mpsc::unbounded_channel();
         let download_manager =
             Arc::new(DownloadManager::new(download_dir, config.username.clone()));
+        let writer = Arc::new(Mutex::new(None));
+        let search_results = Arc::new(RwLock::new(HashMap::new()));
+        let peer = Arc::new(PeerShared::new(
+            config.username.clone(),
+            Arc::clone(&search_results),
+            Arc::clone(&download_manager.downloads),
+            peer_event_tx.clone(),
+            Arc::clone(&writer),
+        ));
 
         Self {
             config,
             state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
-            stream: Arc::new(Mutex::new(None)),
+            reader: Arc::new(Mutex::new(None)),
+            writer,
+            listener: Mutex::new(None),
             search_token: AtomicU32::new(1),
             transfer_token: AtomicU32::new(1000),
             pending_searches: Arc::new(RwLock::new(HashMap::new())),
-            search_results: Arc::new(RwLock::new(HashMap::new())),
-            pending_downloads: Arc::new(RwLock::new(HashMap::new())),
+            search_results,
+            peer,
             download_manager,
             peer_event_tx,
             peer_event_rx: Arc::new(Mutex::new(peer_event_rx)),
@@ -119,8 +120,9 @@ impl SoulseekClient {
         stream.set_nodelay(true)?;
 
         {
-            let mut s = self.stream.lock().await;
-            *s = Some(stream);
+            let (r, w) = stream.into_split();
+            *self.reader.lock().await = Some(r);
+            *self.writer.lock().await = Some(w);
         }
 
         {
@@ -173,9 +175,12 @@ impl SoulseekClient {
                     self.send_raw(&shares_msg).await?;
 
                     // start peer listener for incoming connections
-                    let listener =
-                        PeerListener::new(self.config.listen_port, Arc::clone(&self.state));
-                    listener.start().await;
+                    let listener = PeerListener::new(
+                        self.config.listen_port,
+                        Arc::clone(&self.state),
+                        Arc::clone(&self.peer),
+                    );
+                    *self.listener.lock().await = Some(listener.start().await);
 
                     {
                         let mut state = self.state.write().await;
@@ -243,10 +248,14 @@ impl SoulseekClient {
     }
 
     pub async fn disconnect(&self) {
-        let mut stream = self.stream.lock().await;
-        if let Some(mut s) = stream.take() {
-            let _ = s.shutdown().await;
+        if let Some(mut w) = self.writer.lock().await.take() {
+            let _ = w.shutdown().await;
         }
+        self.reader.lock().await.take();
+        if let Some(l) = self.listener.lock().await.take() {
+            l.abort();
+        }
+        self.peer.shutdown();
         let mut state = self.state.write().await;
         *state = ConnectionState::Disconnected;
     }
@@ -272,94 +281,22 @@ impl SoulseekClient {
             }
         }
 
-        // get the download info
-        let download = self.download_manager.get_download(id).await;
-        if let Some(dl) = download {
-            // request peer address
-            self.request_peer_address(&file.username, dl).await?;
-        }
+        // connect to the uploader and queue the file on its side
+        self.peer.start_download(id);
 
         Ok(id)
     }
 
-    /// request peer address from server
-    async fn request_peer_address(
-        &self,
-        username: &str,
-        download: Download,
-    ) -> Result<(), SoulseekError> {
-        // add to pending
-        {
-            let mut pending = self.pending_downloads.write().await;
-            pending
-                .entry(username.to_string())
-                .or_insert_with(Vec::new)
-                .push(PendingDownload {
-                    download,
-                    username: username.to_string(),
-                });
-        }
-
-        // send GetPeerAddress request
-        let msg = pack_get_peer_address(username);
-        self.send_raw(&msg).await
-    }
-
-    /// handle peer address response and start download
-    async fn handle_peer_address(&self, username: &str, ip: Ipv4Addr, port: u16) {
-        let pending = {
-            let mut pending = self.pending_downloads.write().await;
-            pending.remove(username).unwrap_or_default()
-        };
-
-        let our_username = self.config.username.clone();
-        let event_tx = self.peer_event_tx.clone();
-        let dm = Arc::clone(&self.download_manager);
-
-        for pd in pending {
-            let download = pd.download;
-            let id = download.id;
-            let username_clone = our_username.clone();
-            let tx = event_tx.clone();
-            let dm_clone = Arc::clone(&dm);
-
-            // update state to connecting
-            {
-                let mut downloads = dm_clone.downloads.write().await;
-                if let Some(dl) = downloads.get_mut(&id) {
-                    dl.state = DownloadState::Connecting;
-                }
-            }
-
-            // spawn download task
-            tokio::spawn(async move {
-                let result = peer::download_file(download, ip, port, &username_clone, tx).await;
-
-                // update state based on result
-                let mut downloads = dm_clone.downloads.write().await;
-                if let Some(dl) = downloads.get_mut(&id) {
-                    match result {
-                        Ok(_) => {
-                            dl.state = DownloadState::Complete;
-                            dl.downloaded = dl.size;
-                        }
-                        Err(_) => {
-                            dl.state = DownloadState::Failed;
-                        }
-                    }
-                }
-            });
-        }
-    }
-
     /// cancel a download
     pub async fn cancel_download(&self, id: u32) {
+        self.peer.cancel(id).await;
         self.download_manager.cancel_download(id).await;
     }
 
     /// clear finished downloads
     pub async fn clear_finished_downloads(&self) {
         self.download_manager.clear_finished().await;
+        self.peer.prune().await;
     }
 
     /// get all downloads
@@ -367,50 +304,50 @@ impl SoulseekClient {
         self.download_manager.get_downloads().await
     }
 
-    /// process peer events and update download states
+    /// process peer events and update download states. Finished (complete,
+    /// failed, cancelled) downloads are never touched, so stale events can't
+    /// resurrect a cancelled download.
     pub async fn process_peer_events(&self) {
         let mut rx = self.peer_event_rx.lock().await;
         while let Ok(event) = rx.try_recv() {
+            let mut downloads = self.download_manager.downloads.write().await;
+            let id = match &event {
+                PeerEvent::Connected(id)
+                | PeerEvent::Started(id)
+                | PeerEvent::Progress(id, ..)
+                | PeerEvent::Completed(id)
+                | PeerEvent::Failed(id, _) => *id,
+            };
+            let Some(dl) = downloads.get_mut(&id).filter(|d| d.is_active()) else {
+                continue;
+            };
             match event {
-                PeerEvent::Connected(id) => {
-                    let mut downloads = self.download_manager.downloads.write().await;
-                    if let Some(dl) = downloads.get_mut(&id) {
-                        dl.state = DownloadState::Connecting;
+                // Connected only reports progress of the P connection; the
+                // tasks themselves own the Pending/Connecting transitions
+                PeerEvent::Connected(_) => {}
+                PeerEvent::Started(_) => dl.state = DownloadState::Downloading,
+                PeerEvent::Progress(_, downloaded, total) => {
+                    if dl.size == 0 {
+                        dl.size = total;
                     }
+                    dl.downloaded = dl.downloaded.max(downloaded);
+                    dl.state = DownloadState::Downloading;
                 }
-                PeerEvent::Started(id) => {
-                    let mut downloads = self.download_manager.downloads.write().await;
-                    if let Some(dl) = downloads.get_mut(&id) {
-                        dl.state = DownloadState::Downloading;
-                    }
+                PeerEvent::Completed(_) => {
+                    dl.state = DownloadState::Complete;
+                    dl.downloaded = dl.size;
                 }
-                PeerEvent::Progress(id, downloaded, _total) => {
-                    let mut downloads = self.download_manager.downloads.write().await;
-                    if let Some(dl) = downloads.get_mut(&id) {
-                        dl.downloaded = downloaded;
-                        dl.state = DownloadState::Downloading;
-                    }
-                }
-                PeerEvent::Completed(id) => {
-                    let mut downloads = self.download_manager.downloads.write().await;
-                    if let Some(dl) = downloads.get_mut(&id) {
-                        dl.state = DownloadState::Complete;
-                        dl.downloaded = dl.size;
-                    }
-                }
-                PeerEvent::Failed(id, _reason) => {
-                    let mut downloads = self.download_manager.downloads.write().await;
-                    if let Some(dl) = downloads.get_mut(&id) {
-                        dl.state = DownloadState::Failed;
-                    }
+                PeerEvent::Failed(_, reason) => {
+                    tracing::debug!("soulseek download {} failed: {}", id, reason);
+                    dl.state = DownloadState::Failed;
                 }
             }
         }
     }
 
     async fn send_raw(&self, data: &[u8]) -> Result<(), SoulseekError> {
-        let mut stream = self.stream.lock().await;
-        match stream.as_mut() {
+        let mut writer = self.writer.lock().await;
+        match writer.as_mut() {
             Some(s) => {
                 s.write_all(data).await?;
                 s.flush().await?;
@@ -421,8 +358,8 @@ impl SoulseekClient {
     }
 
     async fn read_message(&self) -> Result<(u32, Vec<u8>), SoulseekError> {
-        let mut stream = self.stream.lock().await;
-        let s = stream.as_mut().ok_or(SoulseekError::NotConnected)?;
+        let mut reader = self.reader.lock().await;
+        let s = reader.as_mut().ok_or(SoulseekError::NotConnected)?;
 
         // read size (4 bytes)
         let mut size_buf = [0u8; 4];
@@ -459,33 +396,34 @@ impl SoulseekClient {
     pub async fn poll(&self) -> Result<Option<ServerMessage>, SoulseekError> {
         let (code, data) = self.read_message().await?;
 
-        // check for peer file search response (code 9 from peer)
-        if code == 9 {
-            if let Ok(result) = parse_file_search_response(&data) {
-                let token = result.token;
-                let mut results = self.search_results.write().await;
-                if let Some(v) = results.get_mut(&token) {
-                    v.push(result.clone());
+        // a malformed body was fully read, so skip it rather than drop the connection
+        let Ok(msg) = parse_server_message(code, &data) else {
+            return Ok(None);
+        };
+
+        match &msg {
+            ServerMessage::GetPeerAddress(pa) => {
+                self.peer.deliver_peer_address(&pa.username, pa.ip, pa.port);
+            }
+            // peer wants us to connect to it (it can't reach our port, or we
+            // asked for it via ConnectToPeer)
+            ServerMessage::ConnectToPeer(ctp) => {
+                let peer = Arc::clone(&self.peer);
+                let (ip, port, token) = (ctp.ip, ctp.port, ctp.token);
+                match ctp.conn_type.as_str() {
+                    "P" => {
+                        let username = ctp.username.clone();
+                        tokio::spawn(async move {
+                            let _ = peer.pierce_p(ip, port, token, username).await;
+                        });
+                    }
+                    "F" if self.peer.has_active_download(&ctp.username).await => {
+                        tokio::spawn(peer.pierce_f(ip, port, token));
+                    }
+                    _ => {}
                 }
-                return Ok(Some(ServerMessage::FileSearchResponse(result)));
             }
-        }
-
-        let msg = parse_server_message(code, &data)?;
-
-        // handle GetPeerAddress response
-        if let ServerMessage::GetPeerAddress(ref pa) = msg {
-            self.handle_peer_address(&pa.username, pa.ip, pa.port).await;
-        }
-
-        // handle ConnectToPeer (indirect connection request)
-        if let ServerMessage::ConnectToPeer(ref ctp) = msg {
-            // peer wants us to connect to them (NAT traversal)
-            if ctp.conn_type == "F" {
-                // file transfer - check if we have pending downloads from this user
-                self.handle_peer_address(&ctp.username, ctp.ip, ctp.port)
-                    .await;
-            }
+            _ => {}
         }
 
         Ok(Some(msg))
@@ -503,7 +441,7 @@ impl SoulseekClient {
                         // message processed
                     }
                     Ok(None) => {}
-                    Err(SoulseekError::ConnectionClosed) => {
+                    Err(SoulseekError::ConnectionClosed | SoulseekError::NotConnected) => {
                         let mut state = self.state.write().await;
                         *state = ConnectionState::Disconnected;
                         break;
@@ -512,7 +450,10 @@ impl SoulseekClient {
                         // timeout is ok, just continue
                     }
                     Err(_e) => {
-                        // log error but continue
+                        // io error or bad framing on the server socket, it won't recover
+                        let mut state = self.state.write().await;
+                        *state = ConnectionState::Disconnected;
+                        break;
                     }
                 }
             }

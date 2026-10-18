@@ -47,6 +47,7 @@ pub enum PeerCode {
     TransferResponse = 41,
     QueueUpload = 43,
     PlaceInQueueResponse = 44,
+    UploadFailed = 46,
     UploadDenied = 50,
     PlaceInQueueRequest = 51,
 }
@@ -241,6 +242,75 @@ pub fn pack_set_status(status: u32) -> Vec<u8> {
     let mut w = MessageWriter::new();
     w.write_u32(status);
     w.into_message(ServerCode::SetStatus as u32)
+}
+
+
+/// server code 3 - ask for a user's address
+pub fn pack_get_peer_address(username: &str) -> Vec<u8> {
+    let mut w = MessageWriter::new();
+    w.write_string(username);
+    w.into_message(ServerCode::GetPeerAddress as u32)
+}
+
+/// server code 18 - ask the server to make `username` connect to us
+pub fn pack_connect_to_peer(token: u32, username: &str, conn_type: &str) -> Vec<u8> {
+    let mut w = MessageWriter::new();
+    w.write_u32(token);
+    w.write_string(username);
+    w.write_string(conn_type);
+    w.into_message(ServerCode::ConnectToPeer as u32)
+}
+
+/// wrap a body in a peer init style frame: u32 length, u8 code, body
+fn into_init_message(code: u8, body: Vec<u8>) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(5 + body.len());
+    msg.extend_from_slice(&((body.len() + 1) as u32).to_le_bytes());
+    msg.push(code);
+    msg.extend(body);
+    msg
+}
+
+/// peer init code 0 - answer to a ConnectToPeer / indirect connection request
+pub fn pack_pierce_firewall(token: u32) -> Vec<u8> {
+    into_init_message(0, token.to_le_bytes().to_vec())
+}
+
+/// peer init code 1 - first message on a connection we open to a peer
+pub fn pack_peer_init(username: &str, conn_type: &str, token: u32) -> Vec<u8> {
+    let mut w = MessageWriter::new();
+    w.write_string(username);
+    w.write_string(conn_type);
+    w.write_u32(token);
+    into_init_message(1, w.buf)
+}
+
+/// peer code 43 - ask the peer to queue a file for upload to us
+pub fn pack_queue_upload(filename: &str) -> Vec<u8> {
+    let mut w = MessageWriter::new();
+    w.write_string(filename);
+    w.into_message(PeerCode::QueueUpload as u32)
+}
+
+/// peer code 41 - reply to a TransferRequest. `reason` is only sent when denied
+pub fn pack_transfer_response(token: u32, allowed: bool, reason: Option<&str>) -> Vec<u8> {
+    let mut w = MessageWriter::new();
+    w.write_u32(token);
+    w.write_bool(allowed);
+    if !allowed {
+        w.write_string(reason.unwrap_or("Cancelled"));
+    }
+    w.into_message(PeerCode::TransferResponse as u32)
+}
+
+/// F connection: the downloader answers the uploader's raw transfer token
+/// with a raw u64 offset (no length prefix, no code)
+pub fn pack_file_offset(offset: u64) -> [u8; 8] {
+    offset.to_le_bytes()
+}
+
+/// F connection: raw transfer token sent by the uploader (no length prefix)
+pub fn pack_file_transfer_init(token: u32) -> [u8; 4] {
+    token.to_le_bytes()
 }
 
 /// server code 35 - tell server how many files/folders we share

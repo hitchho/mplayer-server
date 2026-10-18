@@ -610,6 +610,7 @@ struct Player {
     soulseek_results: Vec<crate::soulseek::SearchResult>,
     soulseek_ranked: Vec<crate::soulseek::RankedFile>,
     soulseek_search_token: Option<u32>,
+    soulseek_max_results: usize,
 }
 
 // methods
@@ -1326,18 +1327,45 @@ impl<'a> Player {
         username: String,
         password: String,
         download_dir: String,
+        server_host: String,
+        server_port: u32,
+        listen_port: u32,
+        max_results: u32,
     ) -> String {
         use crate::soulseek::{SoulseekClient, SoulseekConfig};
         use std::path::PathBuf;
         use std::sync::Arc;
 
+        let server_port = match u16::try_from(server_port) {
+            Ok(p) if p != 0 => p,
+            _ => return format!("invalid server_port: {}", server_port),
+        };
+        let listen_port = match u16::try_from(listen_port) {
+            Ok(p) if p != 0 => p,
+            _ => return format!("invalid listen_port: {}", listen_port),
+        };
+        let server_host = if server_host.trim().is_empty() {
+            "server.slsknet.org".to_string()
+        } else {
+            server_host
+        };
+        let max_results = if max_results == 0 { 50 } else { max_results as usize };
+
+        // drop any previous client so it does not leak
+        if let Some(old) = self.soulseek.take() {
+            old.disconnect().await;
+            self.soulseek_results.clear();
+            self.soulseek_ranked.clear();
+            self.soulseek_search_token = None;
+        }
+
         let config = SoulseekConfig {
             username,
             password,
-            server_host: "server.slsknet.org".to_string(),
-            server_port: 2242,
-            listen_port: 2234,
-            max_results: 50,
+            server_host,
+            server_port,
+            listen_port,
+            max_results,
         };
 
         let download_path = PathBuf::from(download_dir);
@@ -1349,6 +1377,7 @@ impl<'a> Player {
                     if response.success {
                         let client_clone = Arc::clone(&client);
                         client_clone.spawn_receiver();
+                        self.soulseek_max_results = max_results;
                         self.soulseek = Some(client);
                         if response.is_new_account() {
                             "registered and connected".to_string()
@@ -1414,19 +1443,27 @@ impl<'a> Player {
                 self.soulseek_ranked = rank_search_results(&self.soulseek_results);
             }
         }
-        self.soulseek_ranked.clone()
+        self.soulseek_ranked
+            .iter()
+            .take(self.soulseek_max_results)
+            .cloned()
+            .collect()
     }
 
-    /// queue a download by index
-    async fn slsk_download(&mut self, index: u32) -> String {
+    /// queue a download of a specific file from a specific user
+    async fn slsk_download(&mut self, username: String, filename: String) -> String {
         if let Some(client) = &self.soulseek {
-            if let Some(file) = self.soulseek_ranked.get(index as usize) {
+            if let Some(file) = self
+                .soulseek_ranked
+                .iter()
+                .find(|f| f.username == username && f.file.filename == filename)
+            {
                 match client.queue_download(file).await {
                     Ok(id) => format!("queued: {} (id: {})", file.file.basename(), id),
                     Err(e) => format!("download error: {}", e),
                 }
             } else {
-                "invalid index".to_string()
+                "file not found in results".to_string()
             }
         } else {
             "not connected".to_string()
@@ -1524,6 +1561,7 @@ impl Server {
                 soulseek_results: Vec::new(),
                 soulseek_ranked: Vec::new(),
                 soulseek_search_token: None,
+                soulseek_max_results: 50,
             },
         }
     }
@@ -1553,6 +1591,7 @@ impl Server {
                 soulseek_results: Vec::new(),
                 soulseek_ranked: Vec::new(),
                 soulseek_search_token: None,
+                soulseek_max_results: 50,
             },
         }
     }
@@ -2316,10 +2355,14 @@ impl AudioThread {
                 self.play_from_index(self.playlist.playing_index).await;
             }
             PlayAction::RenamePlaylist(old, new) => {
-                self.rename_playlist(old, new).await;
+                if let Err(e) = self.rename_playlist(old, new).await {
+                    error!("failed to rename playlist: {}", e);
+                }
             }
             PlayAction::RemovePlaylist(name) => {
-                self.remove_playlist(name).await;
+                if let Err(e) = self.remove_playlist(name).await {
+                    error!("failed to remove playlist: {}", e);
+                }
             }
         }
         Ok(())

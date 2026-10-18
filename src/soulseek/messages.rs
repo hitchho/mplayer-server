@@ -252,3 +252,194 @@ pub fn parse_peer_message(code: u32, data: &[u8]) -> io::Result<PeerMessage> {
         _ => Ok(PeerMessage::Unknown(code)),
     }
 }
+
+/// peer code 40
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferRequest {
+    /// 0 = download request (to the uploader), 1 = upload (uploader to us)
+    pub direction: u32,
+    pub token: u32,
+    pub filename: String,
+    /// only present when direction == 1
+    pub size: Option<u64>,
+}
+
+pub fn parse_transfer_request(data: &[u8]) -> io::Result<TransferRequest> {
+    let mut r = MessageReader::new(data);
+    let direction = r.read_u32()?;
+    let token = r.read_u32()?;
+    let filename = r.read_string()?;
+    let size = if direction == 1 && r.remaining() >= 8 {
+        Some(r.read_u64()?)
+    } else {
+        None
+    };
+    Ok(TransferRequest {
+        direction,
+        token,
+        filename,
+        size,
+    })
+}
+
+/// peer code 44: (filename, place)
+pub fn parse_place_in_queue(data: &[u8]) -> io::Result<(String, u32)> {
+    let mut r = MessageReader::new(data);
+    Ok((r.read_string()?, r.read_u32()?))
+}
+
+/// peer code 46: filename
+pub fn parse_upload_failed(data: &[u8]) -> io::Result<String> {
+    MessageReader::new(data).read_string()
+}
+
+/// peer code 50: (filename, reason)
+pub fn parse_upload_denied(data: &[u8]) -> io::Result<(String, String)> {
+    let mut r = MessageReader::new(data);
+    Ok((r.read_string()?, r.read_string()?))
+}
+
+/// first message on an incoming peer connection (1-byte code framing)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InitMessage {
+    PierceFirewall(u32),
+    PeerInit {
+        username: String,
+        conn_type: String,
+        token: u32,
+    },
+}
+
+pub fn parse_init_message(code: u8, body: &[u8]) -> io::Result<InitMessage> {
+    let mut r = MessageReader::new(body);
+    match code {
+        0 => Ok(InitMessage::PierceFirewall(r.read_u32()?)),
+        1 => Ok(InitMessage::PeerInit {
+            username: r.read_string()?,
+            conn_type: r.read_string()?,
+            token: r.read_u32()?,
+        }),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "unknown init code")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::protocol::*;
+    use super::*;
+
+    #[test]
+    fn queue_upload_bytes() {
+        // len=4+4+3, code 43, "abc"
+        assert_eq!(
+            pack_queue_upload("abc"),
+            vec![11, 0, 0, 0, 43, 0, 0, 0, 3, 0, 0, 0, b'a', b'b', b'c']
+        );
+    }
+
+    #[test]
+    fn transfer_request_upload_parse() {
+        let mut w = MessageWriter::new();
+        w.write_u32(1);
+        w.write_u32(0xdeadbeef);
+        w.write_string("a\\b.mp3");
+        w.write_u64(5_000_000_000);
+        let msg = w.into_message(40);
+        // strip len + code
+        let req = parse_transfer_request(&msg[8..]).unwrap();
+        assert_eq!(
+            req,
+            TransferRequest {
+                direction: 1,
+                token: 0xdeadbeef,
+                filename: "a\\b.mp3".into(),
+                size: Some(5_000_000_000)
+            }
+        );
+    }
+
+    #[test]
+    fn transfer_request_download_has_no_size() {
+        let mut w = MessageWriter::new();
+        w.write_u32(0);
+        w.write_u32(7);
+        w.write_string("x");
+        let msg = w.into_message(40);
+        let req = parse_transfer_request(&msg[8..]).unwrap();
+        assert_eq!(req.size, None);
+        assert!(parse_transfer_request(&[1, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn transfer_response_bytes() {
+        assert_eq!(
+            pack_transfer_response(0x01020304, true, None),
+            vec![9, 0, 0, 0, 41, 0, 0, 0, 4, 3, 2, 1, 1]
+        );
+        assert_eq!(
+            pack_transfer_response(1, false, Some("no")),
+            vec![15, 0, 0, 0, 41, 0, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0, b'n', b'o']
+        );
+    }
+
+    #[test]
+    fn pierce_firewall_bytes() {
+        assert_eq!(pack_pierce_firewall(0x0a0b0c0d), vec![5, 0, 0, 0, 0, 0x0d, 0x0c, 0x0b, 0x0a]);
+        assert_eq!(
+            parse_init_message(0, &[0x0d, 0x0c, 0x0b, 0x0a]).unwrap(),
+            InitMessage::PierceFirewall(0x0a0b0c0d)
+        );
+    }
+
+    #[test]
+    fn peer_init_roundtrip() {
+        let msg = pack_peer_init("me", "P", 0);
+        assert_eq!(
+            msg,
+            vec![
+                16, 0, 0, 0, 1, 2, 0, 0, 0, b'm', b'e', 1, 0, 0, 0, b'P', 0, 0, 0, 0
+            ]
+        );
+        assert_eq!(
+            parse_init_message(msg[4], &msg[5..]).unwrap(),
+            InitMessage::PeerInit {
+                username: "me".into(),
+                conn_type: "P".into(),
+                token: 0
+            }
+        );
+        assert!(parse_init_message(9, &[]).is_err());
+    }
+
+    #[test]
+    fn connect_to_peer_request_bytes() {
+        assert_eq!(
+            pack_connect_to_peer(5, "bob", "P"),
+            vec![
+                20, 0, 0, 0, 18, 0, 0, 0, 5, 0, 0, 0, 3, 0, 0, 0, b'b', b'o', b'b', 1, 0, 0, 0,
+                b'P'
+            ]
+        );
+    }
+
+    #[test]
+    fn file_transfer_raw_values() {
+        assert_eq!(pack_file_transfer_init(0x11223344), [0x44, 0x33, 0x22, 0x11]);
+        assert_eq!(pack_file_offset(0), [0u8; 8]);
+        assert_eq!(pack_file_offset(1), [1, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn queue_state_messages_parse() {
+        let mut w = MessageWriter::new();
+        w.write_string("f");
+        w.write_string("Banned");
+        let m = w.into_message(50);
+        assert_eq!(parse_upload_denied(&m[8..]).unwrap(), ("f".into(), "Banned".into()));
+        let mut w = MessageWriter::new();
+        w.write_string("f");
+        w.write_u32(3);
+        let m = w.into_message(44);
+        assert_eq!(parse_place_in_queue(&m[8..]).unwrap(), ("f".into(), 3));
+    }
+}

@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
 
-use super::protocol::MessageWriter;
 use super::types::{Download, DownloadState, RankedFile, SearchResult};
 
 /// events sent from download manager to UI
@@ -222,50 +221,4 @@ pub fn rank_search_results(results: &[SearchResult]) -> Vec<RankedFile> {
     ranked.sort_by(|a, b| b.quality_score.cmp(&a.quality_score));
 
     ranked
-}
-
-/// pack transfer request message (peer code 40)
-pub fn pack_transfer_request(
-    direction: u32,
-    token: u32,
-    filename: &str,
-    size: Option<u64>,
-) -> Vec<u8> {
-    let mut w = MessageWriter::new();
-    w.write_u32(direction);
-    w.write_u32(token);
-    w.write_string(filename);
-    if let Some(s) = size {
-        w.write_u64(s);
-    }
-    w.into_message(40)
-}
-
-/// pack file offset message
-pub fn pack_file_offset(offset: u64) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(8);
-    buf.extend_from_slice(&offset.to_le_bytes());
-    buf
-}
-
-/// pack peer init message (peer init code 1)
-pub fn pack_peer_init(username: &str, conn_type: &str) -> Vec<u8> {
-    let mut w = MessageWriter::new();
-    w.write_string(username);
-    w.write_string(conn_type);
-    w.write_u32(0); // token
-
-    // peer init uses 1-byte code
-    let content = w.into_bytes();
-    let mut msg = Vec::with_capacity(5 + content.len());
-    msg.extend_from_slice(&((content.len() + 1) as u32).to_le_bytes());
-    msg.push(1u8); // peer init code
-    msg.extend(content);
-    msg
-}
-
-impl MessageWriter {
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.buf
-    }
 }
